@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speedrunning-plms"
+version = "0.1.0"
+description = "Fast protein language model training components and recipes."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+    { name = "Synthyra" },
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
