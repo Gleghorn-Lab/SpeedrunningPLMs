@@ -27,6 +27,8 @@ def validate_args(args: Namespace) -> None:
         raise ValueError("Only one of --mlm or --masked_diffusion can be true.")
     if args.auto_grad_clip and args.grad_clip > 0:
         raise ValueError("Cannot use both --auto_grad_clip and --grad_clip at the same time. Choose one.")
+    if getattr(args, "push_to_hub", False) and not getattr(args, "hf_model_name", None):
+        raise ValueError("--hf_model_name is required when --push_to_hub is enabled.")
 
 
 def build_model_config(args: Namespace) -> PLMConfig:

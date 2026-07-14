@@ -37,6 +37,7 @@ from speedrunning_plms.training.optimizers import (
     build_optimizers,
     build_schedulers,
 )
+from speedrunning_plms.training.publishing import publish_model_to_hub
 from speedrunning_plms.training.utils import (
     set_seed,
     load_config_from_yaml,
@@ -149,7 +150,8 @@ def arg_parser():
     
     # Evaluation and logging hyperparams
     parser.add_argument("--eval_every", type=int, default=1000, help="Evaluate on validation set every N steps")
-    parser.add_argument("--hf_model_name", type=str, default='lhallee/speedrun', help="Huggingface model name for saving")
+    parser.add_argument("--push_to_hub", action="store_true", help="Publish the final complete model artifact to Hugging Face Hub")
+    parser.add_argument("--hf_model_name", type=str, default=None, help="Hugging Face model repository used only with --push_to_hub")
     parser.add_argument("--save_every", type=int, default=None, help="Save checkpoint every N steps")
     
     # Dataloader params
@@ -477,13 +479,6 @@ class Trainer:
         self.lr_schedulers, self.sliding_window_size_scheduler, self.mask_rate_scheduler = self.init_schedulers()
         self.print0(f"Ready for training!")
 
-        # Push code + config to HF Hub once so the repo is ready for inference
-        if self.master_process and self.args.hf_model_name:
-            self.print0(f"Pushing code and config to {self.args.hf_model_name}...")
-            model_ref = self.model.module if self.ddp_world_size > 1 else self.model
-            model_ref.push_code_and_config_to_hub(self.args.hf_model_name)
-            self.print0("Code and config pushed to hub.")
-        
         # Create decorated versions of methods that should be excluded from timing
         self._run_eval_loader_timed = exclude_from_timer(self.train_timer)(self.run_eval_loader)
         self._save_checkpoint_timed = exclude_from_timer(self.train_timer)(self.save_checkpoint)
@@ -609,13 +604,14 @@ class Trainer:
                 )
             batch_valid_tokens = (input_ids != self.pad_token_id).sum()
             total_tokens += batch_valid_tokens
-            loss, logits = self.model(
+            outputs = self.model(
                 input_ids=input_ids,
                 labels=labels,
                 mask_rate=mask_rate,
                 sliding_window_size=self.sliding_window_size,
-                return_logits=True,
             )
+            loss = outputs.loss
+            logits = outputs.logits
             losses.append(loss.item())
             preds = logits.argmax(dim=-1)
             self._update_confusion(confusion, preds.detach(), labels.detach())
@@ -679,6 +675,23 @@ class Trainer:
         if self.ddp_world_size > 1:
             dist.barrier()
 
+    def publish_final_artifact(self):
+        """Publish only the final, fully trained artifact when explicitly enabled."""
+        if not self.master_process:
+            return None
+        if self.args.push_to_hub:
+            self.print0(
+                f"Publishing final model artifact to {self.args.hf_model_name}..."
+            )
+        result = publish_model_to_hub(
+            self.model,
+            self.args.hf_model_name,
+            enabled=self.args.push_to_hub,
+        )
+        if self.args.push_to_hub:
+            self.print0("Final model artifact published to the Hub.")
+        return result
+
     def train_step(self, step):
         self.model.train()
         
@@ -722,13 +735,13 @@ class Trainer:
                         input_ids, labels, mask_rate = self.train_loader.next_batch()
                         assert input_ids.numel() > 0, "Dataloader returned empty batch even after reset"
                 
-                loss = self.model(
+                outputs = self.model(
                     input_ids=input_ids,
                     labels=labels,
                     mask_rate=mask_rate,
                     sliding_window_size=self.sliding_window_size,
-                    return_logits=False,
-                ) / self.args.grad_accum
+                )
+                loss = outputs.loss / self.args.grad_accum
                 loss.backward()
                 accumulated_loss += loss.item()  # Accumulate the scaled loss
 
@@ -896,12 +909,6 @@ class Trainer:
             self.print0(f'Total train time (hours): {final_training_time_sec / 3600:.2f}')
             # Save final checkpoint locally
             self._save_checkpoint_timed(self.args.num_steps)
-            # Push final weights to HF Hub
-            if self.master_process and self.args.hf_model_name:
-                self.print0(f"Pushing final weights to {self.args.hf_model_name}...")
-                model_ref = self.model.module if self.ddp_world_size > 1 else self.model
-                model_ref.push_weights_to_hub(self.args.hf_model_name)
-                self.print0("Final weights pushed to hub.")
 
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
@@ -940,6 +947,10 @@ class Trainer:
                 "peak_memory_training_gb": torch.cuda.max_memory_allocated() // 1024 // 1024 // 1024,
             }
             self.log_wandb(log_dict, prefix='final')
+
+            # The Hub sees one complete artifact only after training, local
+            # checkpointing, final evaluation, and final logging all succeed.
+            self.publish_final_artifact()
             
         except KeyboardInterrupt:
             self.print0("\nTraining interrupted by user!")

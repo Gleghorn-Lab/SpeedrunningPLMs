@@ -34,13 +34,15 @@ WORKDIR /app
 COPY requirements.txt .
 
 RUN pip install --upgrade pip setuptools && \
-    pip install -r requirements.txt -U && \
-    pip install --force-reinstall torch torchvision --index-url https://download.pytorch.org/whl/cu128 -U && \
-    pip install numpy==1.26.4
-    
+    pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128 -U && \
+    pip install -r requirements.txt
 
 # 5️⃣  Copy the rest of the source
 COPY . .
+
+# Install the package and its repository test tooling. Runtime dependencies
+# were installed above, so this also validates the package metadata in-image.
+RUN pip install -e ".[test]"
 
 # 6️⃣  Change working directory to where the volume will be mounted
 WORKDIR /workspace

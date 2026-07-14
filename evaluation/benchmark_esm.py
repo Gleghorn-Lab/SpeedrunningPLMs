@@ -2,21 +2,21 @@ import torch
 import argparse
 import os
 import pandas as pd
+from pathlib import Path
 from torch.utils.data import DataLoader, Dataset as TorchDataset
 from datasets import Dataset
 from huggingface_hub import hf_hub_download, login
 from tqdm.auto import tqdm
-from sklearn.metrics import (
-    precision_score,
-    recall_score,
-    f1_score,
-    accuracy_score,
-    matthews_corrcoef
-)
 from transformers import AutoModelForMaskedLM, AutoTokenizer
 
 from evaluation.masker import ProteinMasker
-from utils import set_seed
+from speedrunning_plms.evaluation import (
+    download_dataset_split,
+    load_benchmark_manifest,
+    load_benchmark_model,
+    load_benchmark_tokenizer,
+)
+from speedrunning_plms.training.utils import set_seed
 
 
 def parse_args():
@@ -25,6 +25,12 @@ def parse_args():
     parser.add_argument('--batch_size', type=int, default=4)
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--results_dir', type=str, default='results')
+    parser.add_argument(
+        '--manifest',
+        type=str,
+        default=str(Path(__file__).with_name('benchmark_manifest.json')),
+        help='Immutable benchmark asset manifest',
+    )
     return parser.parse_args()
 
 
@@ -59,6 +65,14 @@ class ProteinCollator:
 
 def calculate_metrics(preds, labels):
     """Calculate metrics only where labels != -100"""
+    from sklearn.metrics import (
+        accuracy_score,
+        f1_score,
+        matthews_corrcoef,
+        precision_score,
+        recall_score,
+    )
+
     # Create mask for valid positions (labels != -100)
     valid_mask = labels != -100
     
@@ -104,28 +118,18 @@ def main():
     
     # Initialize components that don't need to be recreated for each model or dataset
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    
-    # Define models once
-    model_names = {
-        'Synthyra/ESM2-8M': 'ESM2-8M',
-        'Synthyra/ESM2-35M': 'ESM2-35M',
-        'Synthyra/ESM2-150M': 'ESM2-150M',
-        'Synthyra/ESMplusplus_small': 'ESMC-300M',
-        'Synthyra/ESMplusplus_large': 'ESMC-600M',
-        'Synthyra/ESM2-650M': 'ESM2-650M',
-        'Synthyra/ESM2-3B': 'ESM2-3B',
-    }
+    manifest = load_benchmark_manifest(args.manifest)
+    tokenizer_asset = manifest['tokenizer']
 
     all_results = []
 
-    datasets = ['omg_prot50', 'og_prot90', 'uniref50']
-
-    for dataset_name in datasets:
+    for dataset_asset in manifest['datasets']:
+        dataset_name = dataset_asset['name']
         for split_type in ['valid', 'test']:
-            local_file = hf_hub_download(
-                repo_id=f"Synthyra/{dataset_name}",
-                filename=f"data/{split_type}-00000-of-00001.parquet",
-                repo_type="dataset"
+            local_file = download_dataset_split(
+                dataset_asset,
+                split_type,
+                downloader=hf_hub_download,
             )
             data = Dataset.from_parquet(local_file)
             print(f"Loaded {dataset_name} {split_type}: {len(data)} sequences")
@@ -134,12 +138,20 @@ def main():
             #sequences = sequences[-100:]  # Uncomment for debugging with smaller subset
             print(f"Shortest sequence: {len(sequences[-1])} tokens")
 
-            for model_name, nickname in model_names.items():
+            for model_asset in manifest['models']:
+                model_name = model_asset['repo_id']
+                nickname = model_asset['nickname']
                 print(f"\nEvaluating {nickname} on {dataset_name} {split_type}")
                 set_seed(42)
 
-                model = AutoModelForMaskedLM.from_pretrained(model_name, trust_remote_code=True).to(device).eval()
-                tokenizer = AutoTokenizer.from_pretrained('facebook/esm2_t33_650M_UR50D')
+                model = load_benchmark_model(
+                    model_asset,
+                    auto_model_cls=AutoModelForMaskedLM,
+                ).to(device).eval()
+                tokenizer = load_benchmark_tokenizer(
+                    tokenizer_asset,
+                    auto_tokenizer_cls=AutoTokenizer,
+                )
 
                 collator = ProteinCollator(tokenizer)
                 dataset = ProteinDataset(sequences)
@@ -206,7 +218,10 @@ def main():
                 result = {
                     'model': nickname,
                     'model_path': model_name,
+                    'model_revision': model_asset['revision'],
                     'dataset': dataset_name,
+                    'dataset_revision': dataset_asset['revision'],
+                    'tokenizer_revision': tokenizer_asset['revision'],
                     'split': split_type,
                     'loss': round(avg_loss, 3),
                     'perplexity': round(perplexity, 3),

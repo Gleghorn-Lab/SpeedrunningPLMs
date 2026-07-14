@@ -166,6 +166,43 @@ flowchart TB
 
 ## Getting Started
 
+### Python package
+
+Install the reusable model, data, optimizer, and training modules from the
+repository root:
+
+```bash
+python -m pip install .
+```
+
+Install optional experiment tracking and launch dependencies with:
+
+```bash
+python -m pip install ".[training]"
+```
+
+Install benchmark dependencies with `python -m pip install ".[evaluation]"`.
+
+Models saved with `save_pretrained()` include the custom model code and
+canonical Transformers `AutoClass` metadata. A local checkpoint can be loaded
+directly with `PLM.from_pretrained(path)`. A model repository can be loaded as
+custom code after inspecting its source and pinning an immutable revision:
+
+```python
+from transformers import AutoModelForMaskedLM
+
+model = AutoModelForMaskedLM.from_pretrained(
+    "organization/model-name",
+    trust_remote_code=True,
+    revision="full-hub-commit-sha",
+    code_revision="full-hub-commit-sha",
+)
+```
+
+The model follows the standard masked-language-model interface. Batched
+`input_ids`, `attention_mask`, and optional `labels` return a
+`MaskedLMOutput` with `loss` and `logits`.
+
 ### Quick Start
 
 On many popular HPC platforms will be missing Python headers `Python.h` which break `torch.compile`. To fix this, run the following code:
@@ -217,11 +254,17 @@ sudo docker run --gpus all --shm-size=128g -v ${PWD}:/workspace speedrun_plm \
     torchrun --standalone --nproc_per_node=NUM_GPUS_ON_YOUR_SYSTEM train.py
 ```
 
-Some key arguments for `train.py` include
+Some key arguments for `train.py` include:
 
-`--hf_token YOUR_HUGGINGFACE_TOKEN`, a Huggingface write token is required to save your models to Huggingface hub
-`--wandb_token YOUR_WANDB_TOKEN`, is required for Weights and Biases (WANDB) logging
-`--yaml_path YOUR_YAML_FILE`, points to an experimental set up with more settings. See `example_yamls/default.yaml` for inspiration
+- `--push_to_hub --hf_model_name ORGANIZATION/MODEL` explicitly enables final model publication. Publication is disabled by default.
+- `--hf_token YOUR_HUGGINGFACE_TOKEN` authenticates an opted-in Hub publication.
+- `--wandb_token YOUR_WANDB_TOKEN` enables Weights and Biases logging.
+- `--yaml_path YOUR_YAML_FILE` points to an experiment configuration. See `example_yamls/default.yaml`.
+
+When publication is enabled, training uploads one complete artifact containing
+weights, configuration, remote code, and its runtime requirements only after
+training and final evaluation succeed. No code-only artifact is uploaded at
+startup.
 
 See [Command-line Argument](#command-line-arguments) for the full list of argument.
 
@@ -271,7 +314,7 @@ This script will automatically:
 | Argument | Type | Default | Description |
 |----------|------|---------|-------------|
 | `--yaml_path` | str | None | Path to YAML file with experiment configuration. CLI arguments override YAML. |
-| `--hf_token` | str | None | HuggingFace token (required for model saving/uploading). Prompted if not provided. |
+| `--hf_token` | str | None | Hugging Face token for an explicitly enabled publication. |
 | `--wandb_token` | str | None | Weights & Biases API token (for experiment tracking). Prompted if not provided. |
 | `--log_name` | str | None | Name for the log file and wandb run. If not set, a random UUID is used. |
 | `--bugfix` | flag | False | Use small batch size and max length for debugging. |
@@ -314,7 +357,8 @@ This script will automatically:
 | `--lr_hidden` | float | 0.05 | Learning rate for hidden layers (Muon). |
 | `--muon_momentum_warmup_steps` | int | 300 | Steps for Muon momentum warmup (0.85 → 0.95). |
 | `--eval_every` | int | 1000 | Evaluate on validation set every N steps. |
-| `--hf_model_name` | str | "lhallee/speedrun" | HuggingFace model name for saving. |
+| `--push_to_hub` | flag | False | Publish one complete final model artifact after successful training and evaluation. |
+| `--hf_model_name` | str | None | Hugging Face destination repository used with `--push_to_hub`. |
 | `--save_every` | int | None | Save checkpoint every N steps (if set). |
 | `--num_workers` | int | 4 | Number of workers for optimized dataloader. |
 | `--prefetch_factor` | int | 2 | Prefetch factor for optimized dataloader. |
@@ -322,6 +366,11 @@ This script will automatically:
 </details>
 
 ## Performance Benchmarks
+
+`evaluation/benchmark_esm.py` loads every model, remote-code module,
+tokenizer, and dataset from the full commit SHA recorded in
+`evaluation/benchmark_manifest.json`. Update that manifest intentionally when
+changing benchmark inputs so result provenance remains reproducible.
 
 ### Recommended Configuration
 

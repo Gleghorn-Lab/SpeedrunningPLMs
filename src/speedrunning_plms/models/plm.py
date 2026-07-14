@@ -6,14 +6,22 @@ from typing import Optional, List
 from dataclasses import dataclass
 from torch.nn.attention.flex_attention import create_block_mask
 from transformers import EsmTokenizer, PretrainedConfig, PreTrainedModel
-from transformers.modeling_outputs import ModelOutput
+from transformers.modeling_outputs import MaskedLMOutput
 
-from speedrunning_plms.models.attention import SelfAttention
-from speedrunning_plms.models.layers import norm, MLP, Linear, BottleneckMLP
+from .attention import SelfAttention
+from .layers import BottleneckMLP, Linear, MLP, correction_fn, norm
+
+
+REMOTE_CODE_AUTO_MAP = {
+    "AutoConfig": "plm.PLMConfig",
+    "AutoModelForMaskedLM": "plm.PLM",
+}
 
 
 @dataclass
 class PLMConfig(PretrainedConfig):
+    model_type = "speedrunning_plm"
+
     def __init__(
         self,
         hidden_size: int = 512,
@@ -26,7 +34,7 @@ class PLMConfig(PretrainedConfig):
         expansion_ratio: float = 2.0,
         soft_logit_cap: float = 16.0,
         sliding_window_size: int = 2048,
-        tie_embeddings: bool = False,
+        tie_embeddings: Optional[bool] = None,
         unet: bool = False,
         patch_unet: bool = False,
         mlm: bool = False,
@@ -40,7 +48,14 @@ class PLMConfig(PretrainedConfig):
         mask_token_id: Optional[int] = None,
         **kwargs,
     ):
-        super().__init__(**kwargs)
+        standard_tie_embeddings = kwargs.pop("tie_word_embeddings", None)
+        if tie_embeddings is None:
+            tie_embeddings = (
+                bool(standard_tie_embeddings)
+                if standard_tie_embeddings is not None
+                else False
+            )
+        super().__init__(tie_word_embeddings=bool(tie_embeddings), **kwargs)
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
         self.num_hidden_layers = num_hidden_layers
@@ -51,7 +66,7 @@ class PLMConfig(PretrainedConfig):
         self.expansion_ratio = expansion_ratio
         self.soft_logit_cap = soft_logit_cap
         self.sliding_window_size = sliding_window_size
-        self.tie_embeddings = tie_embeddings
+        self.tie_embeddings = bool(tie_embeddings)
         self.unet = unet
         self.patch_unet = patch_unet
         self.mlm = mlm
@@ -63,18 +78,17 @@ class PLMConfig(PretrainedConfig):
         self.eos_token_id = eos_token_id
         self.pad_token_id = pad_token_id
         self.mask_token_id = mask_token_id
-        # HuggingFace AutoModel mapping for trust_remote_code
-        self.auto_map = {
-            "AutoModel": "model--PLM",
-            "AutoModelForMaskedLM": "model--PLM",
-        }
+        # Keep the checkpoint self-contained for AutoClass loading with
+        # trust_remote_code=True. Transformers expects module.Class, not
+        # repo--Class, for code stored in the same model repository.
+        existing_auto_map = dict(getattr(self, "auto_map", {}))
+        existing_auto_map.pop("AutoModel", None)
+        self.auto_map = {**existing_auto_map, **REMOTE_CODE_AUTO_MAP}
 
 
-@dataclass
-class ESMOutput(ModelOutput):
-    loss: Optional[torch.Tensor] = None
-    logits: Optional[torch.Tensor] = None
-    last_hidden_state: Optional[torch.Tensor] = None
+# Backwards-compatible public alias. PLM.forward now returns the standard
+# Transformers masked-language-model output type.
+ESMOutput = MaskedLMOutput
 
 
 def get_hidden_sizes(hidden_size: int, num_encoder_layers: int, num_attention_heads: int = 1, max_head_dim: int = 128) -> List[int]:
@@ -297,7 +311,6 @@ class BatchedTransformerBlock(nn.Module):
         )
         self.attn = SelfAttention(config)
 
-        from speedrunning_plms.models.layers import correction_fn
         corrected_dim = correction_fn(expansion_ratio, hidden_size)
         self.mlp_up = Linear(hidden_size, corrected_dim)
         self.mlp_down = Linear(corrected_dim, hidden_size)
@@ -367,6 +380,7 @@ def precompute_multiresolution_masks(
     sliding_window_size: int,
     n_heads: int,
     device: torch.device,
+    attention_mask: Optional[torch.Tensor] = None,
 ) -> List[Optional[object]]:
     """Pre-compute flex attention block masks at each UNet resolution level.
 
@@ -383,6 +397,7 @@ def precompute_multiresolution_masks(
         sliding_window_size: Sliding window size for attention
         n_heads: Number of attention heads
         device: Device for mask computation
+        attention_mask: Optional (B, L) mask where nonzero tokens are valid.
 
     Returns:
         List of BlockMask objects, one per resolution level. None for levels where L<=1.
@@ -392,14 +407,19 @@ def precompute_multiresolution_masks(
     # Compute document IDs from CLS token positions (CLS marks start of each document)
     doc_ids = (input_ids == cls_token_id).cumsum(dim=1)  # (B, L)
 
-    # Find last real (non-pad) token position per batch element
-    is_real = (input_ids != pad_token_id)
-    positions = torch.arange(L, device=device).expand(B, L)
-    last_real = torch.where(is_real, positions, torch.zeros_like(positions)).max(dim=1).values  # (B,)
+    if attention_mask is None:
+        valid_tokens = input_ids != pad_token_id
+    else:
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError(
+                "attention_mask must have the same shape as input_ids; "
+                f"got {attention_mask.shape} and {input_ids.shape}."
+            )
+        valid_tokens = attention_mask.to(device=device, dtype=torch.bool)
 
     masks = []
     current_doc_ids = doc_ids
-    current_last_real = last_real
+    current_valid_tokens = valid_tokens
     current_L = L
 
     for level in range(num_levels):
@@ -408,15 +428,15 @@ def precompute_multiresolution_masks(
             continue
 
         # Capture loop variables in closure via default args
-        def make_mask_mod(doc_ids_l, last_real_l, sw_l):
+        def make_mask_mod(doc_ids_l, valid_tokens_l, sw_l):
             def mask_mod(b, h, q_idx, kv_idx):
                 doc_mask = doc_ids_l[b, q_idx] == doc_ids_l[b, kv_idx]
                 sw_mask = torch.abs(q_idx - kv_idx) < sw_l
-                pad_mask = (q_idx <= last_real_l[b]) & (kv_idx <= last_real_l[b])
+                pad_mask = valid_tokens_l[b, q_idx] & valid_tokens_l[b, kv_idx]
                 return doc_mask & sw_mask & pad_mask
             return mask_mod
 
-        mask_mod = make_mask_mod(current_doc_ids, current_last_real, sliding_window_size)
+        mask_mod = make_mask_mod(current_doc_ids, current_valid_tokens, sliding_window_size)
 
         block_mask = create_block_mask(
             mask_mod=mask_mod,
@@ -428,10 +448,10 @@ def precompute_multiresolution_masks(
         )
         masks.append(block_mask)
 
-        # Downsample doc_ids and last_real for next level
+        # A merged token remains valid if either source token is valid.
         if current_L > 1:
             current_doc_ids = current_doc_ids.view(B, current_L // 2, 2).max(dim=-1).values
-            current_last_real = current_last_real // 2
+            current_valid_tokens = current_valid_tokens.view(B, current_L // 2, 2).any(dim=-1)
             current_L = current_L // 2
 
     return masks
@@ -652,6 +672,8 @@ class BatchedUnetTransformer(nn.Module):
 
 class PLM(PreTrainedModel):
     config_class = PLMConfig
+    _tied_weights_keys = ["lm_head.decoder.weight"]
+
     def __init__(self, config: PLMConfig):
         super().__init__(config)
         self.config = config
@@ -675,6 +697,12 @@ class PLM(PreTrainedModel):
             self.eos_token_id = self.tokenizer.eos_token_id
             self.pad_token_id = self.tokenizer.pad_token_id
             self.mask_token_id = self.tokenizer.mask_token_id
+        # Persist resolved IDs so published checkpoints can reload without
+        # fetching an external tokenizer merely to construct the model.
+        self.config.cls_token_id = self.cls_token_id
+        self.config.eos_token_id = self.eos_token_id
+        self.config.pad_token_id = self.pad_token_id
+        self.config.mask_token_id = self.mask_token_id
         self.mlm = config.mlm
         self.masked_diffusion = config.masked_diffusion
         self.token_dropout = config.token_dropout
@@ -722,13 +750,103 @@ class PLM(PreTrainedModel):
         
         self.ce = nn.CrossEntropyLoss(ignore_index=-100, reduction='mean')
 
-    def get_last_hidden_state(self, input_ids: torch.Tensor, sliding_window_size: int) -> torch.Tensor:
-        if self.patch_unet:
-            # Batched UNet path: input_ids is (B, L)
-            assert input_ids.dim() == 2, f"patch_unet expects (B, L) input, got shape {input_ids.shape}"
-            B, L = input_ids.shape
+    def get_input_embeddings(self) -> nn.Embedding:
+        return self.embedding
 
-            # Pre-compute multi-resolution block masks
+    def set_input_embeddings(self, value: nn.Embedding) -> None:
+        self.embedding = value
+
+    def get_output_embeddings(self) -> Linear:
+        return self.lm_head.decoder
+
+    def set_output_embeddings(self, value: Linear) -> None:
+        self.lm_head.decoder = value
+
+    def _validated_attention_mask(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if attention_mask is None:
+            return input_ids != self.pad_token_id
+        if attention_mask.shape != input_ids.shape:
+            raise ValueError(
+                "attention_mask must have the same shape as input_ids; "
+                f"got {attention_mask.shape} and {input_ids.shape}."
+            )
+        return attention_mask.to(device=input_ids.device, dtype=torch.bool)
+
+    def _get_standard_hidden_state(
+        self,
+        input_ids: torch.Tensor,
+        sliding_window_size: int,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        squeeze_output = input_ids.dim() == 1
+        valid_tokens = self._validated_attention_mask(input_ids, attention_mask)
+        if squeeze_output:
+            input_ids = input_ids.unsqueeze(0)
+            valid_tokens = valid_tokens.unsqueeze(0)
+
+        batch_size, seq_len = input_ids.shape
+        docs = (input_ids == self.cls_token_id).cumsum(dim=1)
+
+        def doc_mask_mod(b, h, q_idx, kv_idx):
+            sliding_mask = torch.abs(q_idx - kv_idx) < sliding_window_size
+            doc_mask = docs[b, q_idx] == docs[b, kv_idx]
+            valid_mask = valid_tokens[b, q_idx] & valid_tokens[b, kv_idx]
+            return sliding_mask & doc_mask & valid_mask
+
+        block_mask = create_block_mask(
+            mask_mod=doc_mask_mod,
+            B=batch_size,
+            H=self.n_heads,
+            Q_LEN=seq_len,
+            KV_LEN=seq_len,
+            device=input_ids.device,
+        )
+
+        x = self.embedding(input_ids)
+        if self.token_dropout:
+            masked_tokens = (input_ids == self.mask_token_id) & valid_tokens
+            x = x.masked_fill(masked_tokens.unsqueeze(-1), 0.0)
+            real_token_count = valid_tokens.sum(dim=1, keepdim=True).float().clamp(min=1)
+            mask_count = masked_tokens.sum(dim=1, keepdim=True).float()
+            mask_ratio_observed = mask_count / real_token_count
+            x = (x * (1 - mask_ratio_observed.unsqueeze(-1))).to(x.dtype)
+
+        x = norm(x)
+        if self.unet:
+            ve = self.value_embeds(input_ids)
+            x = self.transformer(x=x, ve=ve, attention_mask=block_mask)
+        else:
+            x = self.transformer(x=x, attention_mask=block_mask)
+
+        if self.extra_layers is not None:
+            for layer in self.extra_layers:
+                x = layer(x=x, attention_mask=block_mask)
+        return x.squeeze(0) if squeeze_output else x
+
+    def get_last_hidden_state(
+        self,
+        input_ids: torch.Tensor,
+        sliding_window_size: int,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Return hidden states for legacy 1D or standard batched token input."""
+        if input_ids.dim() not in (1, 2):
+            raise ValueError(
+                "input_ids must have shape (sequence_length,) or "
+                f"(batch_size, sequence_length); got {input_ids.shape}."
+            )
+
+        if self.patch_unet:
+            if input_ids.dim() != 2:
+                raise ValueError(
+                    f"patch_unet expects batched (B, L) input, got {input_ids.shape}."
+                )
+            valid_tokens = self._validated_attention_mask(input_ids, attention_mask)
+
             attention_masks = precompute_multiresolution_masks(
                 input_ids=input_ids,
                 cls_token_id=self.cls_token_id,
@@ -737,24 +855,21 @@ class PLM(PreTrainedModel):
                 sliding_window_size=sliding_window_size,
                 n_heads=self.n_heads,
                 device=input_ids.device,
+                attention_mask=valid_tokens,
             )
-
-            # Full resolution mask for extra layers
             full_res_mask = attention_masks[0]
-
-            x = self.embedding(input_ids)  # (B, L, D)
+            x = self.embedding(input_ids)
 
             if self.token_dropout:
-                x = x.masked_fill((input_ids == self.mask_token_id).unsqueeze(-1), 0.0)
-                real_token_count = (input_ids != self.pad_token_id).sum(dim=1, keepdim=True).float().clamp(min=1)
-                mask_count = (input_ids == self.mask_token_id).sum(dim=1, keepdim=True).float()
+                masked_tokens = (input_ids == self.mask_token_id) & valid_tokens
+                x = x.masked_fill(masked_tokens.unsqueeze(-1), 0.0)
+                real_token_count = valid_tokens.sum(dim=1, keepdim=True).float().clamp(min=1)
+                mask_count = masked_tokens.sum(dim=1, keepdim=True).float()
                 mask_ratio_observed = mask_count / real_token_count
                 x = (x * (1 - mask_ratio_observed.unsqueeze(-1))).to(x.dtype)
 
             x = norm(x)
-
             encoder_ve, decoder_ve = self.value_embeds(input_ids)
-
             x = self.transformer(
                 x=x,
                 encoder_ve=encoder_ve,
@@ -763,58 +878,16 @@ class PLM(PreTrainedModel):
                 x0_full=x.clone(),
             )
 
-            # Apply extra layers at full resolution
             if self.extra_layers is not None:
                 for layer in self.extra_layers:
                     x = layer(x=x, attention_mask=full_res_mask)
-
             return x
 
-        # Standard / UNet path: input_ids is 1D (total_len,)
-        docs = (input_ids == self.cls_token_id).cumsum(0)
-        eos_positions = (input_ids == self.eos_token_id).nonzero()
-        if eos_positions.numel() > 0:
-            last_eos = eos_positions[-1].squeeze()
-        else:
-            last_eos = len(input_ids) - 1
-        seq_len = len(input_ids)
-
-        def doc_mask_mod(b, h, q_idx, kv_idx):
-            bidirectional_sliding_window_mask = torch.abs(q_idx - kv_idx) < sliding_window_size
-            doc_mask = docs[q_idx] == docs[kv_idx]
-            pad_mask = (q_idx <= last_eos) & (kv_idx <= last_eos)
-            return bidirectional_sliding_window_mask & doc_mask & pad_mask
-
-        attention_mask = create_block_mask(
-            mask_mod=doc_mask_mod,
-            B=1,
-            H=self.n_heads,
-            Q_LEN=seq_len,
-            KV_LEN=seq_len,
-            device=input_ids.device,
+        return self._get_standard_hidden_state(
+            input_ids,
+            sliding_window_size,
+            attention_mask,
         )
-
-        x = self.embedding(input_ids)
-
-        if self.token_dropout:
-            x = x.masked_fill((input_ids == self.mask_token_id).unsqueeze(-1), 0.0)
-            real_token_count = len(input_ids[:last_eos])
-            mask_ratio_observed = (input_ids == self.mask_token_id).sum().float() / real_token_count
-            x = (x * (1 - mask_ratio_observed)).to(x.dtype)
-
-        x = norm(x)
-
-        if self.unet:
-            ve = self.value_embeds(input_ids)
-            x = self.transformer(x=x, ve=ve, attention_mask=attention_mask, last_eos=last_eos)
-        else:
-            x = self.transformer(x=x, attention_mask=attention_mask, last_eos=last_eos)
-
-        if self.extra_layers is not None:
-            for layer in self.extra_layers:
-                x = layer(x=x, attention_mask=attention_mask, last_eos=last_eos)
-
-        return x
 
     def get_vector_embeddings(self, input_ids: torch.Tensor, sliding_window_size: Optional[int] = None) -> torch.Tensor:
         """Mean-pool hidden states per document to get per-document embeddings.
@@ -831,7 +904,7 @@ class PLM(PreTrainedModel):
             sliding_window_size = self.sliding_window_size
         x = self.get_last_hidden_state(input_ids, sliding_window_size)
 
-        if self.patch_unet:
+        if input_ids.dim() == 2:
             # Batched: x is (B, L, D), input_ids is (B, L)
             B, L, D = x.shape
             doc_ids = (input_ids == self.cls_token_id).cumsum(dim=1)  # (B, L)
@@ -868,31 +941,82 @@ class PLM(PreTrainedModel):
     def forward(
         self,
         input_ids: torch.Tensor,
-        labels: torch.Tensor,
-        mask_rate: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        labels: Optional[torch.Tensor] = None,
+        mask_rate: Optional[torch.Tensor] = None,
         sliding_window_size: Optional[int] = None,
-        return_logits: bool = False,
-        ) -> torch.Tensor:
+        output_hidden_states: Optional[bool] = None,
+        return_dict: Optional[bool] = None,
+        **kwargs,
+    ) -> MaskedLMOutput:
+        """Run masked-language-model inference or training.
+
+        The public contract follows ``AutoModelForMaskedLM``: batched
+        ``input_ids`` and ``attention_mask`` are accepted, ``labels`` are
+        optional, and outputs expose ``loss`` and ``logits`` through a standard
+        ``MaskedLMOutput``. One-dimensional packed input remains supported for
+        the repository's legacy training pipeline.
+        """
         if sliding_window_size is None:
             sliding_window_size = self.sliding_window_size
+        if return_dict is None:
+            return_dict = self.config.use_return_dict
+        if output_hidden_states is None:
+            output_hidden_states = self.config.output_hidden_states
 
-        last_hidden_state = self.get_last_hidden_state(input_ids, sliding_window_size)
-
-        lm_logits = self.lm_head(norm(last_hidden_state)) # (l, v)
-
-        loss = self.ce(
-            lm_logits.view(-1, self.vocab_size),
-            labels.view(-1).long()
+        last_hidden_state = self.get_last_hidden_state(
+            input_ids,
+            sliding_window_size,
+            attention_mask=attention_mask,
         )
-        if self.training and self.masked_diffusion and not self.mlm:
-            loss = loss / mask_rate
+        lm_logits = self.lm_head(norm(last_hidden_state))
 
-        if return_logits:
-            return loss, lm_logits
-        return loss
+        loss = None
+        if labels is not None:
+            if labels.shape != input_ids.shape:
+                raise ValueError(
+                    "labels must have the same shape as input_ids; "
+                    f"got {labels.shape} and {input_ids.shape}."
+                )
+            loss = self.ce(
+                lm_logits.reshape(-1, self.vocab_size),
+                labels.reshape(-1).long(),
+            )
+            if self.training and self.masked_diffusion and not self.mlm:
+                if mask_rate is None:
+                    valid_tokens = self._validated_attention_mask(input_ids, attention_mask)
+                    predicted_tokens = (labels != -100) & valid_tokens
+                    mask_rate = (
+                        predicted_tokens.sum().float()
+                        / valid_tokens.sum().float().clamp(min=1)
+                    )
+                rate = torch.as_tensor(
+                    mask_rate,
+                    device=loss.device,
+                    dtype=loss.dtype,
+                ).mean().clamp(min=torch.finfo(loss.dtype).eps)
+                loss = loss / rate
+
+        hidden_states = (last_hidden_state,) if output_hidden_states else None
+        if not return_dict:
+            output = (lm_logits,)
+            if hidden_states is not None:
+                output += (hidden_states,)
+            return ((loss,) + output) if loss is not None else output
+
+        return MaskedLMOutput(
+            loss=loss,
+            logits=lm_logits,
+            hidden_states=hidden_states,
+        )
 
     @torch.no_grad()
-    def get_logits(self, input_ids: torch.Tensor, sliding_window_size: Optional[int] = None) -> torch.Tensor:
+    def get_logits(
+        self,
+        input_ids: torch.Tensor,
+        sliding_window_size: Optional[int] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """Get LM logits without computing loss.
 
         Args:
@@ -904,7 +1028,11 @@ class PLM(PreTrainedModel):
         """
         if sliding_window_size is None:
             sliding_window_size = self.sliding_window_size
-        hidden = self.get_last_hidden_state(input_ids, sliding_window_size)
+        hidden = self.get_last_hidden_state(
+            input_ids,
+            sliding_window_size,
+            attention_mask=attention_mask,
+        )
         return self.lm_head(norm(hidden))
 
     @torch.no_grad()
@@ -949,38 +1077,6 @@ class PLM(PreTrainedModel):
                 # Mean pool per document
                 return self.get_vector_embeddings(input_ids, sliding_window_size)
 
-    def push_code_and_config_to_hub(self, repo_id: str):
-        """Push source code and model config to HuggingFace Hub (no weights).
-
-        Call once at the start of training so the repo is ready for
-        trust_remote_code=True loading as soon as weights are uploaded later.
-        """
-        import shutil
-        import tempfile
-        from pathlib import Path
-        from huggingface_hub import HfApi
-
-        with tempfile.TemporaryDirectory() as tmpdir:
-            # Save only the config (this also writes config.json)
-            self.config.save_pretrained(tmpdir)
-
-            tmp_path = Path(tmpdir)
-            package_root = Path(__file__).resolve().parents[1]
-            package_dst = tmp_path / "speedrunning_plms"
-            shutil.copytree(package_root, package_dst, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-            (tmp_path / "model.py").write_text(
-                "from speedrunning_plms.models import PLM, PLMConfig\n",
-                encoding="utf-8",
-            )
-
-            api = HfApi()
-            api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
-            api.upload_folder(
-                folder_path=tmpdir,
-                repo_id=repo_id,
-                repo_type="model",
-            )
-
     def save_weights_local(self, save_dir: str, step: int):
         """Save model weights and optimizer-resumable checkpoint locally."""
         from pathlib import Path
@@ -988,21 +1084,11 @@ class PLM(PreTrainedModel):
         save_path.mkdir(parents=True, exist_ok=True)
         self.save_pretrained(save_path / f"step_{step:06d}")
 
-    def push_weights_to_hub(self, repo_id: str):
-        """Push model weights to HuggingFace Hub (code + config already there)."""
-        import tempfile
-        from huggingface_hub import HfApi
 
-        with tempfile.TemporaryDirectory() as tmpdir:
-            self.save_pretrained(tmpdir)
-
-            api = HfApi()
-            api.create_repo(repo_id=repo_id, repo_type="model", exist_ok=True)
-            api.upload_folder(
-                folder_path=tmpdir,
-                repo_id=repo_id,
-                repo_type="model",
-            )
+# Tell Transformers to copy these source files and emit canonical AutoClass
+# mappings whenever config/model artifacts are saved for local or Hub use.
+PLMConfig.register_for_auto_class()
+PLM.register_for_auto_class("AutoModelForMaskedLM")
 
 
 if __name__ == "__main__":
@@ -1010,8 +1096,6 @@ if __name__ == "__main__":
     import sys
     import io
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8')
-
-    from torchinfo import summary
 
     print("=" * 80)
     print("Testing Original UNet Transformer")
@@ -1036,7 +1120,7 @@ if __name__ == "__main__":
     labels[labels != 32] = -100
     mask_rate = torch.tensor(0.15).cuda()
 
-    loss = model(input_ids, labels, mask_rate)
+    loss = model(input_ids=input_ids, labels=labels, mask_rate=mask_rate).loss
     print(f"Original UNet loss: {loss.item():.4f}")
 
     print("\n" + "=" * 80)
@@ -1069,7 +1153,11 @@ if __name__ == "__main__":
     batched_labels = batched_ids.clone()
     batched_labels[batched_labels != 32] = -100
 
-    loss = patch_model(batched_ids, batched_labels, mask_rate)
+    loss = patch_model(
+        input_ids=batched_ids,
+        labels=batched_labels,
+        mask_rate=mask_rate,
+    ).loss
     print(f"Batched UNet loss: {loss.item():.4f}")
 
     print(f"\nHidden sizes: {patch_model.transformer.hidden_sizes}")
@@ -1100,7 +1188,11 @@ if __name__ == "__main__":
     n_mlp_dec = sum(1 for b in deep_model.transformer.decoder_blocks if isinstance(b, BottleneckMLP))
     print(f"Decoder: {n_transformer_dec} transformer blocks, {n_mlp_dec} MLP blocks")
 
-    loss = deep_model(batched_ids, batched_labels, mask_rate)
+    loss = deep_model(
+        input_ids=batched_ids,
+        labels=batched_labels,
+        mask_rate=mask_rate,
+    ).loss
     print(f"Deep Batched UNet loss: {loss.item():.4f}")
 
     print("\n" + "=" * 80)
@@ -1108,7 +1200,6 @@ if __name__ == "__main__":
     print("=" * 80)
 
     # Verify mask shapes at each resolution level
-    from speedrunning_plms.models import precompute_multiresolution_masks
     masks = precompute_multiresolution_masks(
         input_ids=batched_ids,
         cls_token_id=0,

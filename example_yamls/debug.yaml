@@ -65,6 +65,7 @@ muon_momentum_warmup_steps: 100
 
 # Evaluation & Logging
 eval_every: 100
+push_to_hub: false
 hf_model_name: null
 save_every: null
 

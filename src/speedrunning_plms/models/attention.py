@@ -3,9 +3,9 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 from typing import Optional
-from torch.nn.attention.flex_attention import flex_attention
+from torch.nn.attention.flex_attention import create_mask, flex_attention
 
-from speedrunning_plms.models.layers import norm, Linear
+from .layers import Linear, norm
 
 
 class Rotary(nn.Module):
@@ -86,14 +86,36 @@ class SelfAttention(nn.Module):
         if attention_mask is None:
             assert l <= 1, "attention_mask is required for seq_len > 1 to avoid dense attention"
         
-        y = self.flex_attention(
-            q.transpose(1, 2),
-            k.transpose(1, 2),
-            v.transpose(1, 2),
-            score_mod=None,
-            block_mask=attention_mask,
-            enable_gqa=True,
-        )
+        q, k, v = q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2)
+        if q.device.type == "cpu":
+            # FlexAttention does not support CPU backward. Build the exact
+            # token-level mask from the BlockMask closure and use PyTorch's
+            # differentiable dense attention fallback for CPU use.
+            dense_mask = None
+            if attention_mask is not None:
+                dense_mask = create_mask(
+                    attention_mask.mask_mod,
+                    B=B,
+                    H=self.n_heads,
+                    Q_LEN=l,
+                    KV_LEN=l,
+                    device=q.device,
+                )
+            y = F.scaled_dot_product_attention(
+                q,
+                k,
+                v,
+                attn_mask=dense_mask,
+            )
+        else:
+            y = self.flex_attention(
+                q,
+                k,
+                v,
+                score_mod=None,
+                block_mask=attention_mask,
+                enable_gqa=True,
+            )
         y = y.transpose(1, 2).contiguous().view(B, l, d)
         y = self.Wo(y)
 
