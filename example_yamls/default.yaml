@@ -65,6 +65,7 @@ muon_momentum_warmup_steps: 300
 
 # Evaluation & Logging
 eval_every: 1000
+push_to_hub: false
 hf_model_name: "lhallee/speedrun"
 save_every: null # Number of steps between checkpoints
 
